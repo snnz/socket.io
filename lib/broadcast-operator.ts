@@ -130,6 +130,23 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
   }
 
   /**
+   * Sets a modifier for a subsequent event emission that the callback will be called with an error when the
+   * given number of milliseconds have elapsed without an acknowledgement from a client
+   *
+   * @return a new BroadcastOperator instance
+   * @public
+   */
+  public timeout(timeout: number): BroadcastOperator<EmitEvents, SocketData> {
+    const flags = Object.assign({}, this.flags, { timeout });
+    return new BroadcastOperator(
+      this.adapter,
+      this.rooms,
+      this.exceptRooms,
+      flags
+    );
+  }
+
+  /**
    * Emits to all clients.
    *
    * @return Always true
@@ -143,14 +160,14 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
       throw new Error(`"${ev}" is a reserved event name`);
     }
     // set up packet object
-    const data = [ev, ...args];
+    const data: any[] = [ev, ...args];
     const packet = {
       type: PacketType.EVENT,
       data: data,
     };
 
     if ("function" == typeof data[data.length - 1]) {
-      throw new Error("Callbacks are not supported when broadcasting");
+      this.flags.ack = data.pop();
     }
 
     this.adapter.broadcast(packet, {

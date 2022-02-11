@@ -140,7 +140,7 @@ export class Socket<
   private readonly adapter: Adapter;
   private acks: Map<number, () => void> = new Map();
   private fns: Array<(event: Event, next: (err?: Error) => void) => void> = [];
-  private flags: BroadcastFlags & { timeout?: number } = {};
+  private flags: BroadcastFlags = {};
   private _anyListeners?: Array<(...args: any[]) => void>;
 
   /**
@@ -213,7 +213,7 @@ export class Socket<
       const id = this.nsp._ids++;
       debug("emitting packet with ack id %d", id);
 
-      this.registerAckCallback(id, data.pop());
+      this.registerAckCallback(id, data.pop(), this.flags.timeout);
       packet.id = id;
     }
 
@@ -226,10 +226,9 @@ export class Socket<
   }
 
   /**
-   * @private
+   * @public
    */
-  private registerAckCallback(id: number, ack: (...args: any[]) => void): void {
-    const timeout = this.flags.timeout;
+  public registerAckCallback(id: number, ack: (...args: any[]) => void, timeout?: number): void {
     if (timeout === undefined) {
       this.acks.set(id, ack);
       return;
