@@ -25,9 +25,23 @@ const debug = debugModule("socket.io:socket");
 
 type ClientReservedEvents = "connect_error";
 
+// TODO for next major release: cleanup disconnect reasons
+export type DisconnectReason =
+  // Engine.IO close reasons
+  | "transport error"
+  | "transport close"
+  | "forced close"
+  | "ping timeout"
+  | "parse error"
+  // Socket.IO disconnect reasons
+  | "server shutting down"
+  | "forced server close"
+  | "client namespace disconnect"
+  | "server namespace disconnect";
+
 export interface SocketReservedEventsMap {
-  disconnect: (reason: string) => void;
-  disconnecting: (reason: string) => void;
+  disconnect: (reason: DisconnectReason) => void;
+  disconnecting: (reason: DisconnectReason) => void;
   error: (err: Error) => void;
 }
 
@@ -112,6 +126,8 @@ export interface Handshake {
  */
 export type Event = [string, ...any[]];
 
+function noop() {}
+
 export class Socket<
   ListenEvents extends EventsMap = DefaultEventsMap,
   EmitEvents extends EventsMap = ListenEvents,
@@ -142,6 +158,7 @@ export class Socket<
   private fns: Array<(event: Event, next: (err?: Error) => void) => void> = [];
   private flags: BroadcastFlags = {};
   private _anyListeners?: Array<(...args: any[]) => void>;
+  private _anyOutgoingListeners?: Array<(...args: any[]) => void>;
 
   /**
    * Interface to a `Client` for a given `Namespace`.
@@ -200,7 +217,7 @@ export class Socket<
     ...args: EventParams<EmitEvents, Ev>
   ): boolean {
     if (RESERVED_EVENTS.has(ev)) {
-      throw new Error(`"${ev}" is a reserved event name`);
+      throw new Error(`"${String(ev)}" is a reserved event name`);
     }
     const data: any[] = [ev, ...args];
     const packet: any = {
@@ -220,6 +237,7 @@ export class Socket<
     const flags = Object.assign({}, this.flags);
     this.flags = {};
 
+    this.notifyOutgoingListeners(packet);
     this.packet(packet, flags);
 
     return true;
@@ -404,9 +422,6 @@ export class Socket<
       case PacketType.DISCONNECT:
         this.ondisconnect();
         break;
-
-      case PacketType.CONNECT_ERROR:
-        this._onerror(new Error(packet.data));
     }
   }
 
@@ -507,16 +522,26 @@ export class Socket<
    *
    * @private
    */
-  _onclose(reason: string): this | undefined {
+  _onclose(reason: DisconnectReason): this | undefined {
     if (!this.connected) return this;
     debug("closing socket - reason %s", reason);
     this.emitReserved("disconnecting", reason);
-    this.leaveAll();
+    this._cleanup();
     this.nsp._remove(this);
     this.client._remove(this);
     this.connected = false;
     this.emitReserved("disconnect", reason);
     return;
+  }
+
+  /**
+   * Makes the socket leave all the rooms it was part of and prevents it from joining any other room
+   *
+   * @private
+   */
+  _cleanup() {
+    this.leaveAll();
+    this.join = noop;
   }
 
   /**
@@ -709,8 +734,8 @@ export class Socket<
   }
 
   /**
-   * Adds a listener that will be fired when any event is emitted. The event name is passed as the first argument to the
-   * callback.
+   * Adds a listener that will be fired when any event is received. The event name is passed as the first argument to
+   * the callback.
    *
    * @param listener
    * @public
@@ -722,8 +747,8 @@ export class Socket<
   }
 
   /**
-   * Adds a listener that will be fired when any event is emitted. The event name is passed as the first argument to the
-   * callback. The listener is added to the beginning of the listeners array.
+   * Adds a listener that will be fired when any event is received. The event name is passed as the first argument to
+   * the callback. The listener is added to the beginning of the listeners array.
    *
    * @param listener
    * @public
@@ -735,7 +760,7 @@ export class Socket<
   }
 
   /**
-   * Removes the listener that will be fired when any event is emitted.
+   * Removes the listener that will be fired when any event is received.
    *
    * @param listener
    * @public
@@ -766,6 +791,114 @@ export class Socket<
    */
   public listenersAny() {
     return this._anyListeners || [];
+  }
+
+  /**
+   * Adds a listener that will be fired when any event is emitted. The event name is passed as the first argument to the
+   * callback.
+   *
+   * @param listener
+   *
+   * <pre><code>
+   *
+   * socket.onAnyOutgoing((event, ...args) => {
+   *   console.log(event);
+   * });
+   *
+   * </pre></code>
+   *
+   * @public
+   */
+  public onAnyOutgoing(listener: (...args: any[]) => void): this {
+    this._anyOutgoingListeners = this._anyOutgoingListeners || [];
+    this._anyOutgoingListeners.push(listener);
+    return this;
+  }
+
+  /**
+   * Adds a listener that will be fired when any event is emitted. The event name is passed as the first argument to the
+   * callback. The listener is added to the beginning of the listeners array.
+   *
+   * @param listener
+   *
+   * <pre><code>
+   *
+   * socket.prependAnyOutgoing((event, ...args) => {
+   *   console.log(event);
+   * });
+   *
+   * </pre></code>
+   *
+   * @public
+   */
+  public prependAnyOutgoing(listener: (...args: any[]) => void): this {
+    this._anyOutgoingListeners = this._anyOutgoingListeners || [];
+    this._anyOutgoingListeners.unshift(listener);
+    return this;
+  }
+
+  /**
+   * Removes the listener that will be fired when any event is emitted.
+   *
+   * @param listener
+   *
+   * <pre><code>
+   *
+   * const handler = (event, ...args) => {
+   *   console.log(event);
+   * }
+   *
+   * socket.onAnyOutgoing(handler);
+   *
+   * // then later
+   * socket.offAnyOutgoing(handler);
+   *
+   * </pre></code>
+   *
+   * @public
+   */
+  public offAnyOutgoing(listener?: (...args: any[]) => void): this {
+    if (!this._anyOutgoingListeners) {
+      return this;
+    }
+    if (listener) {
+      const listeners = this._anyOutgoingListeners;
+      for (let i = 0; i < listeners.length; i++) {
+        if (listener === listeners[i]) {
+          listeners.splice(i, 1);
+          return this;
+        }
+      }
+    } else {
+      this._anyOutgoingListeners = [];
+    }
+    return this;
+  }
+
+  /**
+   * Returns an array of listeners that are listening for any event that is specified. This array can be manipulated,
+   * e.g. to remove listeners.
+   *
+   * @public
+   */
+  public listenersAnyOutgoing() {
+    return this._anyOutgoingListeners || [];
+  }
+
+  /**
+   * Notify the listeners for each packet sent (emit or broadcast)
+   *
+   * @param packet
+   *
+   * @private
+   */
+  private notifyOutgoingListeners(packet: Packet) {
+    if (this._anyOutgoingListeners && this._anyOutgoingListeners.length) {
+      const listeners = this._anyOutgoingListeners.slice();
+      for (const listener of listeners) {
+        listener.apply(this, packet.data);
+      }
+    }
   }
 
   private newBroadcastOperator(): BroadcastOperator<EmitEvents, SocketData> {

@@ -130,11 +130,17 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
   }
 
   /**
-   * Sets a modifier for a subsequent event emission that the callback will be called with an error when the
-   * given number of milliseconds have elapsed without an acknowledgement from a client
+   * Adds a timeout in milliseconds for the next operation
    *
-   * @return a new BroadcastOperator instance
-   * @public
+   * <pre><code>
+   *
+   * io.timeout(1000).emit("some-event", (err, responses) => {
+   *   // ...
+   * });
+   *
+   * </pre></code>
+   *
+   * @param timeout
    */
   public timeout(timeout: number): BroadcastOperator<EmitEvents, SocketData> {
     const flags = Object.assign({}, this.flags, { timeout });
@@ -157,7 +163,7 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
     ...args: EventParams<EmitEvents, Ev>
   ): boolean {
     if (RESERVED_EVENTS.has(ev)) {
-      throw new Error(`"${ev}" is a reserved event name`);
+      throw new Error(`"${String(ev)}" is a reserved event name`);
     }
     // set up packet object
     const data: any[] = [ev, ...args];
@@ -205,6 +211,7 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
       .fetchSockets({
         rooms: this.rooms,
         except: this.exceptRooms,
+        flags: this.flags,
       })
       .then((sockets) => {
         return sockets.map((socket) => {
@@ -232,6 +239,7 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
       {
         rooms: this.rooms,
         except: this.exceptRooms,
+        flags: this.flags,
       },
       Array.isArray(room) ? room : [room]
     );
@@ -248,6 +256,7 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
       {
         rooms: this.rooms,
         except: this.exceptRooms,
+        flags: this.flags,
       },
       Array.isArray(room) ? room : [room]
     );
@@ -264,6 +273,7 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
       {
         rooms: this.rooms,
         except: this.exceptRooms,
+        flags: this.flags,
       },
       close
     );
