@@ -53,7 +53,7 @@ describe("socket.io with uWebSocket.js-based engine", () => {
 
     const partialDone = createPartialDone(done, 4);
     client.on("connect", partialDone);
-    clientWSOnly.on("connect", partialDone);
+    clientWSOnly.once("connect", partialDone);
     clientPollingOnly.on("connect", partialDone);
     clientCustomNamespace.on("connect", partialDone);
   });
@@ -200,7 +200,9 @@ describe("socket.io with uWebSocket.js-based engine", () => {
       .buffer(true)
       .end((err, res) => {
         if (err) return done(err);
-        expect(res.headers["content-type"]).to.be("application/javascript");
+        expect(res.headers["content-type"]).to.be(
+          "application/javascript; charset=utf-8"
+        );
         expect(res.headers.etag).to.be('"' + clientVersion + '"');
         expect(res.headers["x-sourcemap"]).to.be(undefined);
         expect(res.text).to.match(/engine\.io/);

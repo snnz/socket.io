@@ -1,6 +1,12 @@
 import fs = require("fs");
 import { join } from "path";
-import { createClient, getPort, success, successFn } from "./support/util";
+import {
+  createClient,
+  createPartialDone,
+  getPort,
+  success,
+  successFn,
+} from "./support/util";
 import { Server } from "..";
 import expect from "expect.js";
 
@@ -599,6 +605,24 @@ describe("socket", () => {
     });
   });
 
+  it("should emit an event and wait for the acknowledgement", (done) => {
+    const io = new Server(0);
+    const socket = createClient(io);
+
+    io.on("connection", async (s) => {
+      socket.on("hi", (a, b, fn) => {
+        expect(a).to.be(1);
+        expect(b).to.be(2);
+        fn(3);
+      });
+
+      const val = await s.emitWithAck("hi", 1, 2);
+      expect(val).to.be(3);
+
+      success(done, io, socket);
+    });
+  });
+
   it("should have access to the client", (done) => {
     const io = new Server(0);
     const socket = createClient(io);
@@ -731,7 +755,7 @@ describe("socket", () => {
     });
   });
 
-  it("should enable compresion by default", (done) => {
+  it("should enable compression by default", (done) => {
     const io = new Server(0);
     const socket = createClient(io, "/chat");
 
@@ -740,11 +764,11 @@ describe("socket", () => {
         expect(packet.options.compress).to.be(true);
         success(done, io, socket);
       });
-      io.of("/chat").emit("woot", "hi");
+      s.emit("woot", "hi");
     });
   });
 
-  it("should disable compresion", (done) => {
+  it("should disable compression", (done) => {
     const io = new Server(0);
     const socket = createClient(io, "/chat");
 
@@ -753,7 +777,7 @@ describe("socket", () => {
         expect(packet.options.compress).to.be(false);
         success(done, io, socket);
       });
-      io.of("/chat").compress(false).emit("woot", "hi");
+      s.compress(false).emit("woot", "hi");
     });
   });
 
@@ -995,6 +1019,22 @@ describe("socket", () => {
       });
     });
 
+    it("should call listener when broadcasting binary data", (done) => {
+      const io = new Server(0);
+      const clientSocket = createClient(io, "/", { multiplex: false });
+
+      io.on("connection", (socket) => {
+        socket.onAnyOutgoing((event, arg1) => {
+          expect(event).to.be("my-event");
+          expect(arg1).to.be.an(Uint8Array);
+
+          success(done, io, clientSocket);
+        });
+
+        io.emit("my-event", Uint8Array.of(1, 2, 3));
+      });
+    });
+
     it("should prepend listener", (done) => {
       const io = new Server(0);
       const clientSocket = createClient(io, "/", { multiplex: false });
@@ -1038,6 +1078,31 @@ describe("socket", () => {
 
         socket.emit("my-event", "123");
       });
+    });
+
+    it("should disconnect all namespaces when calling disconnect(true)", (done) => {
+      const io = new Server(0);
+      io.of("/foo");
+      io.of("/bar");
+
+      const socket1 = createClient(io, "/", {
+        transports: ["websocket"],
+      });
+      const socket2 = createClient(io, "/foo");
+      const socket3 = createClient(io, "/bar");
+
+      io.of("/bar").on("connection", (socket) => {
+        socket.disconnect(true);
+      });
+
+      const partialDone = createPartialDone(
+        3,
+        successFn(done, io, socket1, socket2, socket3)
+      );
+
+      socket1.on("disconnect", partialDone);
+      socket2.on("disconnect", partialDone);
+      socket3.on("disconnect", partialDone);
     });
   });
 });

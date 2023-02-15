@@ -1,5 +1,6 @@
 import http = require("http");
 import type { Server as HTTPSServer } from "https";
+import type { Http2SecureServer } from "http2";
 import { createReadStream } from "fs";
 import { createDeflate, createGzip, createBrotliCompress } from "zlib";
 import accepts = require("accepts");
@@ -16,11 +17,16 @@ import { Client } from "./client";
 import { EventEmitter } from "events";
 import { ExtendedError, Namespace, ServerReservedEventsMap } from "./namespace";
 import { ParentNamespace } from "./parent-namespace";
-import { Adapter, Room, SocketId } from "socket.io-adapter";
+import {
+  Adapter,
+  SessionAwareAdapter,
+  Room,
+  SocketId,
+} from "socket.io-adapter";
 import * as parser from "socket.io-parser";
 import type { Encoder } from "socket.io-parser";
 import debugModule from "debug";
-import { Socket } from "./socket";
+import { Socket, DisconnectReason } from "./socket";
 import type { BroadcastOperator, RemoteSocket } from "./broadcast-operator";
 import {
   EventsMap,
@@ -28,8 +34,14 @@ import {
   EventParams,
   StrictEventEmitter,
   EventNames,
+  DecorateAcknowledgementsWithTimeoutAndMultipleResponses,
+  AllButLast,
+  Last,
+  FirstArg,
+  SecondArg,
 } from "./typed-events";
 import { patchAdapter, restoreAdapter, serveFile } from "./uws";
+import type { BaseServer } from "engine.io/build/server";
 
 const debug = debugModule("socket.io:server");
 
@@ -70,8 +82,58 @@ interface ServerOptions extends EngineOptions, AttachOptions {
    * @default 45000
    */
   connectTimeout: number;
+  /**
+   * Whether to enable the recovery of connection state when a client temporarily disconnects.
+   *
+   * The connection state includes the missed packets, the rooms the socket was in and the `data` attribute.
+   */
+  connectionStateRecovery: {
+    /**
+     * The backup duration of the sessions and the packets.
+     *
+     * @default 120000 (2 minutes)
+     */
+    maxDisconnectionDuration?: number;
+    /**
+     * Whether to skip middlewares upon successful connection state recovery.
+     *
+     * @default true
+     */
+    skipMiddlewares?: boolean;
+  };
+  /**
+   * Whether to remove child namespaces that have no sockets connected to them
+   * @default false
+   */
+  cleanupEmptyChildNamespaces: boolean;
 }
 
+/**
+ * Represents a Socket.IO server.
+ *
+ * @example
+ * import { Server } from "socket.io";
+ *
+ * const io = new Server();
+ *
+ * io.on("connection", (socket) => {
+ *   console.log(`socket ${socket.id} connected`);
+ *
+ *   // send an event to the client
+ *   socket.emit("foo", "bar");
+ *
+ *   socket.on("foobar", () => {
+ *     // an event was received from the client
+ *   });
+ *
+ *   // upon disconnection
+ *   socket.on("disconnect", (reason) => {
+ *     console.log(`socket ${socket.id} disconnected due to ${reason}`);
+ *   });
+ * });
+ *
+ * io.listen(3000);
+ */
 export class Server<
   ListenEvents extends EventsMap = DefaultEventsMap,
   EmitEvents extends EventsMap = ListenEvents,
@@ -96,14 +158,11 @@ export class Server<
   /**
    * A reference to the underlying Engine.IO server.
    *
-   * Example:
-   *
-   * <code>
-   *   const clientsCount = io.engine.clientsCount;
-   * </code>
+   * @example
+   * const clientsCount = io.engine.clientsCount;
    *
    */
-  public engine: any;
+  public engine: BaseServer;
 
   /** @private */
   readonly _parser: typeof parser;
@@ -123,7 +182,7 @@ export class Server<
   > = new Map();
   private _adapter?: AdapterConstructor;
   private _serveClient: boolean;
-  private opts: Partial<EngineOptions>;
+  private readonly opts: Partial<ServerOptions>;
   private eio: Engine;
   private _path: string;
   private clientPathRegex: RegExp;
@@ -132,18 +191,17 @@ export class Server<
    * @private
    */
   _connectTimeout: number;
-  private httpServer: http.Server | HTTPSServer;
+  private httpServer: http.Server | HTTPSServer | Http2SecureServer;
 
   /**
    * Server constructor.
    *
    * @param srv http server, port, or options
    * @param [opts]
-   * @public
    */
   constructor(opts?: Partial<ServerOptions>);
   constructor(
-    srv?: http.Server | HTTPSServer | number,
+    srv?: http.Server | HTTPSServer | Http2SecureServer | number,
     opts?: Partial<ServerOptions>
   );
   constructor(
@@ -152,6 +210,7 @@ export class Server<
       | Partial<ServerOptions>
       | http.Server
       | HTTPSServer
+      | Http2SecureServer
       | number,
     opts?: Partial<ServerOptions>
   );
@@ -161,6 +220,7 @@ export class Server<
       | Partial<ServerOptions>
       | http.Server
       | HTTPSServer
+      | Http2SecureServer
       | number,
     opts: Partial<ServerOptions> = {}
   ) {
@@ -178,11 +238,29 @@ export class Server<
     this.serveClient(false !== opts.serveClient);
     this._parser = opts.parser || parser;
     this.encoder = new this._parser.Encoder();
-    this.adapter(opts.adapter || Adapter);
-    this.sockets = this.of("/");
     this.opts = opts;
+    if (opts.connectionStateRecovery) {
+      opts.connectionStateRecovery = Object.assign(
+        {
+          maxDisconnectionDuration: 2 * 60 * 1000,
+          skipMiddlewares: true,
+        },
+        opts.connectionStateRecovery
+      );
+      this.adapter(opts.adapter || SessionAwareAdapter);
+    } else {
+      this.adapter(opts.adapter || Adapter);
+    }
+    opts.cleanupEmptyChildNamespaces = !!opts.cleanupEmptyChildNamespaces;
+    this.sockets = this.of("/");
     if (srv || typeof srv == "number")
-      this.attach(srv as http.Server | HTTPSServer | number);
+      this.attach(
+        srv as http.Server | HTTPSServer | Http2SecureServer | number
+      );
+  }
+
+  get _opts() {
+    return this.opts;
   }
 
   /**
@@ -190,7 +268,6 @@ export class Server<
    *
    * @param v - whether to serve client code
    * @return self when setting or value when getting
-   * @public
    */
   public serveClient(v: boolean): this;
   public serveClient(): boolean;
@@ -253,7 +330,6 @@ export class Server<
    *
    * @param {String} v pathname
    * @return {Server|String} self when setting or value when getting
-   * @public
    */
   public path(v: string): this;
   public path(): string;
@@ -275,7 +351,6 @@ export class Server<
   /**
    * Set the delay after which a client without namespace is closed
    * @param v
-   * @public
    */
   public connectTimeout(v: number): this;
   public connectTimeout(): number;
@@ -291,7 +366,6 @@ export class Server<
    *
    * @param v pathname
    * @return self when setting or value when getting
-   * @public
    */
   public adapter(): AdapterConstructor | undefined;
   public adapter(v: AdapterConstructor): this;
@@ -312,10 +386,9 @@ export class Server<
    * @param srv - server or port
    * @param opts - options passed to engine.io
    * @return self
-   * @public
    */
   public listen(
-    srv: http.Server | HTTPSServer | number,
+    srv: http.Server | HTTPSServer | Http2SecureServer | number,
     opts: Partial<ServerOptions> = {}
   ): this {
     return this.attach(srv, opts);
@@ -327,10 +400,9 @@ export class Server<
    * @param srv - server or port
    * @param opts - options passed to engine.io
    * @return self
-   * @public
    */
   public attach(
-    srv: http.Server | HTTPSServer | number,
+    srv: http.Server | HTTPSServer | Http2SecureServer | number,
     opts: Partial<ServerOptions> = {}
   ): this {
     if ("function" == typeof srv) {
@@ -416,7 +488,7 @@ export class Server<
         res.writeHeader("cache-control", "public, max-age=0");
         res.writeHeader(
           "content-type",
-          "application/" + (isMap ? "json" : "javascript")
+          "application/" + (isMap ? "json" : "javascript") + "; charset=utf-8"
         );
         res.writeHeader("etag", expectedEtag);
 
@@ -436,7 +508,7 @@ export class Server<
    * @private
    */
   private initEngine(
-    srv: http.Server | HTTPSServer,
+    srv: http.Server | HTTPSServer | Http2SecureServer,
     opts: EngineOptions & AttachOptions
   ): void {
     // initialize engine
@@ -459,7 +531,9 @@ export class Server<
    * @param srv http server
    * @private
    */
-  private attachServe(srv: http.Server | HTTPSServer): void {
+  private attachServe(
+    srv: http.Server | HTTPSServer | Http2SecureServer
+  ): void {
     debug("attaching client serving req handler");
 
     const evs = srv.listeners("request").slice(0);
@@ -507,7 +581,7 @@ export class Server<
     res.setHeader("Cache-Control", "public, max-age=0");
     res.setHeader(
       "Content-Type",
-      "application/" + (isMap ? "json" : "javascript")
+      "application/" + (isMap ? "json" : "javascript") + "; charset=utf-8"
     );
     res.setHeader("ETag", expectedEtag);
 
@@ -559,11 +633,10 @@ export class Server<
   /**
    * Binds socket.io to an engine.io instance.
    *
-   * @param {engine.Server} engine engine.io (or compatible) server
+   * @param engine engine.io (or compatible) server
    * @return self
-   * @public
    */
-  public bind(engine): this {
+  public bind(engine: BaseServer): this {
     this.engine = engine;
     this.engine.on("connection", this.onconnection.bind(this));
     return this;
@@ -589,9 +662,20 @@ export class Server<
   /**
    * Looks up a namespace.
    *
-   * @param {String|RegExp|Function} name nsp name
+   * @example
+   * // with a simple string
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * // with a regex
+   * const dynamicNsp = io.of(/^\/dynamic-\d+$/).on("connection", (socket) => {
+   *   const namespace = socket.nsp; // newNamespace.name === "/dynamic-101"
+   *
+   *   // broadcast to all clients in the given sub-namespace
+   *   namespace.emit("hello");
+   * });
+   *
+   * @param name - nsp name
    * @param fn optional, nsp `connection` ev handler
-   * @public
    */
   public of(
     name: string | RegExp | ParentNspNameMatchFn,
@@ -637,7 +721,6 @@ export class Server<
    * Closes server connection
    *
    * @param [fn] optional, called as `fn([err])` on error OR all conns closed
-   * @public
    */
   public close(fn?: (err?: Error) => void): void {
     for (const socket of this.sockets.sockets.values()) {
@@ -657,10 +740,15 @@ export class Server<
   }
 
   /**
-   * Sets up namespace middleware.
+   * Registers a middleware, which is a function that gets executed for every incoming {@link Socket}.
    *
-   * @return self
-   * @public
+   * @example
+   * io.use((socket, next) => {
+   *   // ...
+   *   next();
+   * });
+   *
+   * @param fn - the middleware function
    */
   public use(
     fn: (
@@ -675,43 +763,91 @@ export class Server<
   /**
    * Targets a room when emitting.
    *
-   * @param room
-   * @return self
-   * @public
+   * @example
+   * // the “foo” event will be broadcast to all connected clients in the “room-101” room
+   * io.to("room-101").emit("foo", "bar");
+   *
+   * // with an array of rooms (a client will be notified at most once)
+   * io.to(["room-101", "room-102"]).emit("foo", "bar");
+   *
+   * // with multiple chained calls
+   * io.to("room-101").to("room-102").emit("foo", "bar");
+   *
+   * @param room - a room, or an array of rooms
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public to(room: Room | Room[]): BroadcastOperator<EmitEvents, SocketData> {
+  public to(room: Room | Room[]) {
     return this.sockets.to(room);
   }
 
   /**
-   * Targets a room when emitting.
+   * Targets a room when emitting. Similar to `to()`, but might feel clearer in some cases:
    *
-   * @param room
-   * @return self
-   * @public
+   * @example
+   * // disconnect all clients in the "room-101" room
+   * io.in("room-101").disconnectSockets();
+   *
+   * @param room - a room, or an array of rooms
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public in(room: Room | Room[]): BroadcastOperator<EmitEvents, SocketData> {
+  public in(room: Room | Room[]) {
     return this.sockets.in(room);
   }
 
   /**
    * Excludes a room when emitting.
    *
-   * @param name
-   * @return self
-   * @public
+   * @example
+   * // the "foo" event will be broadcast to all connected clients, except the ones that are in the "room-101" room
+   * io.except("room-101").emit("foo", "bar");
+   *
+   * // with an array of rooms
+   * io.except(["room-101", "room-102"]).emit("foo", "bar");
+   *
+   * // with multiple chained calls
+   * io.except("room-101").except("room-102").emit("foo", "bar");
+   *
+   * @param room - a room, or an array of rooms
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public except(
-    name: Room | Room[]
-  ): BroadcastOperator<EmitEvents, SocketData> {
-    return this.sockets.except(name);
+  public except(room: Room | Room[]) {
+    return this.sockets.except(room);
+  }
+
+  /**
+   * Emits an event and waits for an acknowledgement from all clients.
+   *
+   * @example
+   * try {
+   *   const responses = await io.timeout(1000).emitWithAck("some-event");
+   *   console.log(responses); // one response per client
+   * } catch (e) {
+   *   // some clients did not acknowledge the event in the given delay
+   * }
+   *
+   * @return a Promise that will be fulfilled when all clients have acknowledged the event
+   */
+  public emitWithAck<Ev extends EventNames<EmitEvents>>(
+    ev: Ev,
+    ...args: AllButLast<EventParams<EmitEvents, Ev>>
+  ): Promise<SecondArg<Last<EventParams<EmitEvents, Ev>>>> {
+    return this.sockets.emitWithAck(ev, ...args);
   }
 
   /**
    * Sends a `message` event to all clients.
    *
+   * This method mimics the WebSocket.send() method.
+   *
+   * @see https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/send
+   *
+   * @example
+   * io.send("hello");
+   *
+   * // this is equivalent to
+   * io.emit("message", "hello");
+   *
    * @return self
-   * @public
    */
   public send(...args: EventParams<EmitEvents, "message">): this {
     this.sockets.emit("message", ...args);
@@ -719,10 +855,9 @@ export class Server<
   }
 
   /**
-   * Sends a `message` event to all clients.
+   * Sends a `message` event to all clients. Alias of {@link send}.
    *
    * @return self
-   * @public
    */
   public write(...args: EventParams<EmitEvents, "message">): this {
     this.sockets.emit("message", ...args);
@@ -730,23 +865,69 @@ export class Server<
   }
 
   /**
-   * Emit a packet to other Socket.IO servers
+   * Sends a message to the other Socket.IO servers of the cluster.
+   *
+   * @example
+   * io.serverSideEmit("hello", "world");
+   *
+   * io.on("hello", (arg1) => {
+   *   console.log(arg1); // prints "world"
+   * });
+   *
+   * // acknowledgements (without binary content) are supported too:
+   * io.serverSideEmit("ping", (err, responses) => {
+   *  if (err) {
+   *     // some servers did not acknowledge the event in the given delay
+   *   } else {
+   *     console.log(responses); // one response per server (except the current one)
+   *   }
+   * });
+   *
+   * io.on("ping", (cb) => {
+   *   cb("pong");
+   * });
    *
    * @param ev - the event name
    * @param args - an array of arguments, which may include an acknowledgement callback at the end
-   * @public
    */
   public serverSideEmit<Ev extends EventNames<ServerSideEvents>>(
     ev: Ev,
-    ...args: EventParams<ServerSideEvents, Ev>
+    ...args: EventParams<
+      DecorateAcknowledgementsWithTimeoutAndMultipleResponses<ServerSideEvents>,
+      Ev
+    >
   ): boolean {
     return this.sockets.serverSideEmit(ev, ...args);
   }
 
   /**
+   * Sends a message and expect an acknowledgement from the other Socket.IO servers of the cluster.
+   *
+   * @example
+   * try {
+   *   const responses = await io.serverSideEmitWithAck("ping");
+   *   console.log(responses); // one response per server (except the current one)
+   * } catch (e) {
+   *   // some servers did not acknowledge the event in the given delay
+   * }
+   *
+   * @param ev - the event name
+   * @param args - an array of arguments
+   *
+   * @return a Promise that will be fulfilled when all servers have acknowledged the event
+   */
+  public serverSideEmitWithAck<Ev extends EventNames<ServerSideEvents>>(
+    ev: Ev,
+    ...args: AllButLast<EventParams<ServerSideEvents, Ev>>
+  ): Promise<FirstArg<Last<EventParams<ServerSideEvents, Ev>>>[]> {
+    return this.sockets.serverSideEmitWithAck(ev, ...args);
+  }
+
+  /**
    * Gets a list of socket ids.
    *
-   * @public
+   * @deprecated this method will be removed in the next major release, please use {@link Server#serverSideEmit} or
+   * {@link Server#fetchSockets} instead.
    */
   public allSockets(): Promise<Set<SocketId>> {
     return this.sockets.allSockets();
@@ -755,13 +936,13 @@ export class Server<
   /**
    * Sets the compress flag.
    *
+   * @example
+   * io.compress(false).emit("hello");
+   *
    * @param compress - if `true`, compresses the sending data
-   * @return self
-   * @public
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public compress(
-    compress: boolean
-  ): BroadcastOperator<EmitEvents, SocketData> {
+  public compress(compress: boolean) {
     return this.sockets.compress(compress);
   }
 
@@ -770,33 +951,39 @@ export class Server<
    * receive messages (because of network slowness or other issues, or because they’re connected through long polling
    * and is in the middle of a request-response cycle).
    *
-   * @return self
-   * @public
+   * @example
+   * io.volatile.emit("hello"); // the clients may or may not receive it
+   *
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public get volatile(): BroadcastOperator<EmitEvents, SocketData> {
+  public get volatile() {
     return this.sockets.volatile;
   }
 
   /**
    * Sets a modifier for a subsequent event emission that the event data will only be broadcast to the current node.
    *
-   * @return self
-   * @public
+   * @example
+   * // the “foo” event will be broadcast to all connected clients on this node
+   * io.local.emit("foo", "bar");
+   *
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public get local(): BroadcastOperator<EmitEvents, SocketData> {
+  public get local() {
     return this.sockets.local;
   }
 
   /**
-   * Adds a timeout in milliseconds for the next operation
+   * Adds a timeout in milliseconds for the next operation.
    *
-   * <pre><code>
-   *
+   * @example
    * io.timeout(1000).emit("some-event", (err, responses) => {
-   *   // ...
+   *   if (err) {
+   *     // some clients did not acknowledge the event in the given delay
+   *   } else {
+   *     console.log(responses); // one response per client
+   *   }
    * });
-   *
-   * </pre></code>
    *
    * @param timeout
    */
@@ -805,41 +992,85 @@ export class Server<
   }
 
   /**
-   * Returns the matching socket instances
+   * Returns the matching socket instances.
    *
-   * @public
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
+   *
+   * @example
+   * // return all Socket instances
+   * const sockets = await io.fetchSockets();
+   *
+   * // return all Socket instances in the "room1" room
+   * const sockets = await io.in("room1").fetchSockets();
+   *
+   * for (const socket of sockets) {
+   *   console.log(socket.id);
+   *   console.log(socket.handshake);
+   *   console.log(socket.rooms);
+   *   console.log(socket.data);
+   *
+   *   socket.emit("hello");
+   *   socket.join("room1");
+   *   socket.leave("room2");
+   *   socket.disconnect();
+   * }
    */
   public fetchSockets(): Promise<RemoteSocket<EmitEvents, SocketData>[]> {
     return this.sockets.fetchSockets();
   }
 
   /**
-   * Makes the matching socket instances join the specified rooms
+   * Makes the matching socket instances join the specified rooms.
    *
-   * @param room
-   * @public
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
+   *
+   * @example
+   *
+   * // make all socket instances join the "room1" room
+   * io.socketsJoin("room1");
+   *
+   * // make all socket instances in the "room1" room join the "room2" and "room3" rooms
+   * io.in("room1").socketsJoin(["room2", "room3"]);
+   *
+   * @param room - a room, or an array of rooms
    */
-  public socketsJoin(room: Room | Room[]): void {
+  public socketsJoin(room: Room | Room[]) {
     return this.sockets.socketsJoin(room);
   }
 
   /**
-   * Makes the matching socket instances leave the specified rooms
+   * Makes the matching socket instances leave the specified rooms.
    *
-   * @param room
-   * @public
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
+   *
+   * @example
+   * // make all socket instances leave the "room1" room
+   * io.socketsLeave("room1");
+   *
+   * // make all socket instances in the "room1" room leave the "room2" and "room3" rooms
+   * io.in("room1").socketsLeave(["room2", "room3"]);
+   *
+   * @param room - a room, or an array of rooms
    */
-  public socketsLeave(room: Room | Room[]): void {
+  public socketsLeave(room: Room | Room[]) {
     return this.sockets.socketsLeave(room);
   }
 
   /**
-   * Makes the matching socket instances disconnect
+   * Makes the matching socket instances disconnect.
+   *
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
+   *
+   * @example
+   * // make all socket instances disconnect (the connections might be kept alive for other namespaces)
+   * io.disconnectSockets();
+   *
+   * // make all socket instances in the "room1" room disconnect and close the underlying connections
+   * io.in("room1").disconnectSockets(true);
    *
    * @param close - whether to close the underlying connection
-   * @public
    */
-  public disconnectSockets(close: boolean = false): void {
+  public disconnectSockets(close: boolean = false) {
     return this.sockets.disconnectSockets(close);
   }
 }
@@ -865,5 +1096,12 @@ module.exports.Server = Server;
 module.exports.Namespace = Namespace;
 module.exports.Socket = Socket;
 
-export { Socket, ServerOptions, Namespace, BroadcastOperator, RemoteSocket };
+export {
+  Socket,
+  DisconnectReason,
+  ServerOptions,
+  Namespace,
+  BroadcastOperator,
+  RemoteSocket,
+};
 export { Event } from "./socket";

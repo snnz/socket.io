@@ -1,3 +1,266 @@
+# History
+
+## 2023
+
+- [4.6.0](#460-2023-02-07) (Feb 2023)
+
+## 2022
+
+- [4.5.4](#454-2022-11-22) (Nov 2022)
+- [4.5.3](#453-2022-10-15) (Oct 2022)
+- [4.5.2](#452-2022-09-02) (Sep 2022)
+- [2.5.0](#250-2022-06-26) (Jun 2022) (from the [2.x](https://github.com/socketio/socket.io/tree/2.x) branch)
+- [4.5.1](#451-2022-05-17) (May 2022)
+- [4.5.0](#450-2022-04-23) (Apr 2022)
+- [4.4.1](#441-2022-01-06) (Jan 2022)
+
+## 2021
+
+- [4.4.0](#440-2021-11-18) (Nov 2021)
+- [4.3.2](#432-2021-11-08) (Nov 2021)
+- [4.3.1](#431-2021-10-16) (Oct 2021)
+- [4.3.0](#430-2021-10-14) (Oct 2021)
+- [4.2.0](#420-2021-08-30) (Aug 2021)
+- [4.1.3](#413-2021-07-10) (Jul 2021)
+- [4.1.2](#412-2021-05-17) (May 2021)
+- [4.1.1](#411-2021-05-11) (May 2021)
+- [4.1.0](#410-2021-05-11) (May 2021)
+- [4.0.2](#402-2021-05-06) (May 2021)
+- [4.0.1](#401-2021-03-31) (Mar 2021)
+- [**4.0.0**](#400-2021-03-10) (Mar 2021)
+- [3.1.2](#312-2021-02-26) (Feb 2021)
+- [3.1.1](#311-2021-02-03) (Feb 2021)
+- [3.1.0](#310-2021-01-15) (Jan 2021)
+- [2.4.1](#241-2021-01-07) (Jan 2021) (from the [2.x](https://github.com/socketio/socket.io/tree/2.x) branch)
+- [3.0.5](#305-2021-01-05) (Jan 2021)
+- [2.4.0](#240-2021-01-04) (Jan 2021) (from the [2.x](https://github.com/socketio/socket.io/tree/2.x) branch)
+
+## 2020
+
+- [3.0.4](#304-2020-12-07) (Dec 2020)
+- [3.0.3](#303-2020-11-19) (Nov 2020)
+- [3.0.2](#302-2020-11-17) (Nov 2020)
+- [3.0.1](#301-2020-11-09) (Nov 2020)
+- [**3.0.0**](#300-2020-11-05) (Nov 2020)
+
+## 2019
+
+- [2.3.0](#230-2019-09-20) (Sep 2019)
+
+## 2018
+
+- [2.2.0](#220-2018-11-29) (Nov 2018)
+- [2.1.1](#211-2018-05-17) (May 2018)
+- [2.1.0](#210-2018-03-29) (Mar 2018)
+
+
+# Release notes
+
+# [4.6.0](https://github.com/socketio/socket.io/compare/4.5.4...4.6.0) (2023-02-07)
+
+
+### Bug Fixes
+
+* add timeout method to remote socket ([#4558](https://github.com/socketio/socket.io/issues/4558)) ([0c0eb00](https://github.com/socketio/socket.io/commit/0c0eb0016317218c2be3641e706cfaa9bea39a2d))
+* **typings:** properly type emits with timeout ([f3ada7d](https://github.com/socketio/socket.io/commit/f3ada7d8ccc02eeced2b9b9ac8e4bc921eb630d2))
+
+
+### Features
+
+#### Promise-based acknowledgements
+
+This commit adds some syntactic sugar around acknowledgements:
+
+- `emitWithAck()`
+
+```js
+try {
+  const responses = await io.timeout(1000).emitWithAck("some-event");
+  console.log(responses); // one response per client
+} catch (e) {
+  // some clients did not acknowledge the event in the given delay
+}
+
+io.on("connection", async (socket) => {
+    // without timeout
+  const response = await socket.emitWithAck("hello", "world");
+
+  // with a specific timeout
+  try {
+    const response = await socket.timeout(1000).emitWithAck("hello", "world");
+  } catch (err) {
+    // the client did not acknowledge the event in the given delay
+  }
+});
+```
+
+- `serverSideEmitWithAck()`
+
+```js
+try {
+  const responses = await io.timeout(1000).serverSideEmitWithAck("some-event");
+  console.log(responses); // one response per server (except itself)
+} catch (e) {
+  // some servers did not acknowledge the event in the given delay
+}
+```
+
+Added in [184f3cf](https://github.com/socketio/socket.io/commit/184f3cf7af57acc4b0948eee307f25f8536eb6c8).
+
+#### Connection state recovery
+
+This feature allows a client to reconnect after a temporary disconnection and restore its state:
+
+- id
+- rooms
+- data
+- missed packets
+
+Usage:
+
+```js
+import { Server } from "socket.io";
+
+const io = new Server({
+  connectionStateRecovery: {
+    // default values
+    maxDisconnectionDuration: 2 * 60 * 1000,
+    skipMiddlewares: true,
+  },
+});
+
+io.on("connection", (socket) => {
+  console.log(socket.recovered); // whether the state was recovered or not
+});
+```
+
+Here's how it works:
+
+- the server sends a session ID during the handshake (which is different from the current `id` attribute, which is public and can be freely shared)
+- the server also includes an offset in each packet (added at the end of the data array, for backward compatibility)
+- upon temporary disconnection, the server stores the client state for a given delay (implemented at the adapter level)
+- upon reconnection, the client sends both the session ID and the last offset it has processed, and the server tries to restore the state
+
+The in-memory adapter already supports this feature, and we will soon update the Postgres and MongoDB adapters. We will also create a new adapter based on [Redis Streams](https://redis.io/docs/data-types/streams/), which will support this feature.
+
+Added in [54d5ee0](https://github.com/socketio/socket.io/commit/54d5ee05a684371191e207b8089f09fc24eb5107).
+
+#### Compatibility (for real) with Express middlewares
+
+This feature implements middlewares at the Engine.IO level, because Socket.IO middlewares are meant for namespace authorization and are not executed during a classic HTTP request/response cycle.
+
+Syntax:
+
+```js
+io.engine.use((req, res, next) => {
+  // do something
+
+  next();
+});
+
+// with express-session
+import session from "express-session";
+
+io.engine.use(session({
+  secret: "keyboard cat",
+  resave: false,
+  saveUninitialized: true,
+  cookie: { secure: true }
+}));
+
+// with helmet
+import helmet from "helmet";
+
+io.engine.use(helmet());
+```
+
+A workaround was possible by using the allowRequest option and the "headers" event, but this feels way cleaner and works with upgrade requests too.
+
+Added in [24786e7](https://github.com/socketio/engine.io/commit/24786e77c5403b1c4b5a2bc84e2af06f9187f74a).
+
+#### Error details in the disconnecting and disconnect events
+
+The `disconnect` event will now contain additional details about the disconnection reason.
+
+```js
+io.on("connection", (socket) => {
+  socket.on("disconnect", (reason, description) => {
+    console.log(description);
+  });
+});
+```
+
+Added in [8aa9499](https://github.com/socketio/socket.io/commit/8aa94991cee5518567d6254eec04b23f81510257).
+
+#### Automatic removal of empty child namespaces
+
+This commit adds a new option, "cleanupEmptyChildNamespaces". With this option enabled (disabled by default), when a socket disconnects from a dynamic namespace and if there are no other sockets connected to it then the namespace will be cleaned up and its adapter will be closed. 
+
+```js
+import { createServer } from "node:http";
+import { Server } from "socket.io";
+
+const httpServer = createServer();
+const io = new Server(httpServer, {
+  cleanupEmptyChildNamespaces: true
+});
+```
+
+Added in [5d9220b](https://github.com/socketio/socket.io/commit/5d9220b69adf73e086c27bbb63a4976b348f7c4c).
+
+#### A new "addTrailingSlash" option
+
+The trailing slash which was added by default can now be disabled:
+
+```js
+import { createServer } from "node:http";
+import { Server } from "socket.io";
+
+const httpServer = createServer();
+const io = new Server(httpServer, {
+  addTrailingSlash: false
+});
+```
+
+In the example above, the clients can omit the trailing slash and use `/socket.io` instead of `/socket.io/`.
+
+Added in [d0fd474](https://github.com/socketio/engine.io/commit/d0fd4746afa396297f07bb62e539b0c1c4018d7c).
+
+### Performance Improvements
+
+* precompute the WebSocket frames when broadcasting ([da2b542](https://github.com/socketio/socket.io/commit/da2b54279749adc5279c9ac4742b01b36c01cff0))
+
+
+### Dependencies
+
+- [`engine.io@~6.4.0`](https://github.com/socketio/engine.io/releases/tag/6.4.0) ([diff](https://github.com/socketio/engine.io/compare/6.2.0...6.2.1))
+- [`ws@~8.11.0`](https://github.com/websockets/ws/releases/tag/8.11.0) ([diff](https://github.com/websockets/ws/compare/8.2.3...8.11.0))
+
+
+## [4.5.4](https://github.com/socketio/socket.io/compare/4.5.3...4.5.4) (2022-11-22)
+
+This release contains a bump of:
+
+- `engine.io` in order to fix [CVE-2022-41940](https://github.com/socketio/engine.io/security/advisories/GHSA-r7qp-cfhv-p84w)
+- `socket.io-parser` in order to fix [CVE-2022-2421](https://github.com/advisories/GHSA-qm95-pgcg-qqfq).
+
+### Dependencies
+
+- [`engine.io@~6.2.1`](https://github.com/socketio/engine.io/releases/tag/6.2.1) ([diff](https://github.com/socketio/engine.io/compare/6.2.0...6.2.1))
+- [`ws@~8.2.3`](https://github.com/websockets/ws/releases/tag/8.2.3) (no change)
+
+
+
+## [4.5.3](https://github.com/socketio/socket.io/compare/4.5.2...4.5.3) (2022-10-15)
+
+
+### Bug Fixes
+
+* **typings:** accept an HTTP2 server in the constructor ([d3d0a2d](https://github.com/socketio/socket.io/commit/d3d0a2d5beaff51fd145f810bcaf6914213f8a06))
+* **typings:** apply types to "io.timeout(...).emit()" calls ([e357daf](https://github.com/socketio/socket.io/commit/e357daf5858560bc84e7e50cd36f0278d6721ea1))
+
+
+
 ## [4.5.2](https://github.com/socketio/socket.io/compare/4.5.1...4.5.2) (2022-09-02)
 
 
@@ -5,6 +268,24 @@
 
 * prevent the socket from joining a room after disconnection ([18f3fda](https://github.com/socketio/socket.io/commit/18f3fdab12947a9fee3e9c37cfc1da97027d1473))
 * **uws:** prevent the server from crashing after upgrade ([ba497ee](https://github.com/socketio/socket.io/commit/ba497ee3eb52c4abf1464380d015d8c788714364))
+
+
+
+# [2.5.0](https://github.com/socketio/socket.io/compare/2.4.1...2.5.0) (2022-06-26)
+
+⚠️ WARNING ⚠️
+
+The default value of the maxHttpBufferSize option has been decreased from 100 MB to 1 MB, in order to prevent attacks by denial of service.
+
+Security advisory: [GHSA-j4f2-536g-r55m](https://github.com/advisories/GHSA-j4f2-536g-r55m)
+
+
+### Bug Fixes
+
+* fix race condition in dynamic namespaces ([05e1278](https://github.com/socketio/socket.io/commit/05e1278cfa99f3ecf3f8f0531ffe57d850e9a05b))
+* ignore packet received after disconnection ([22d4bdf](https://github.com/socketio/socket.io/commit/22d4bdf00d1a03885dc0171125faddfaef730066))
+* only set 'connected' to true after middleware execution ([226cc16](https://github.com/socketio/socket.io/commit/226cc16165f9fe60f16ff4d295fb91c8971cde35))
+* prevent the socket from joining a room after disconnection ([f223178](https://github.com/socketio/socket.io/commit/f223178eb655a7713303b21a78f9ef9e161d6458))
 
 
 
@@ -244,6 +525,16 @@ we only add a field in the JSON-encoded handshake data:
 * allow integers as event names ([1c220dd](https://github.com/socketio/socket.io-parser/commit/1c220ddbf45ea4b44bc8dbf6f9ae245f672ba1b9))
 
 
+
+## [2.4.1](https://github.com/socketio/socket.io/compare/2.4.0...2.4.1) (2021-01-07)
+
+
+### Reverts
+
+* fix(security): do not allow all origins by default ([a169050](https://github.com/socketio/socket.io/commit/a1690509470e9dd5559cec4e60908ca6c23e9ba0))
+
+
+
 ## [3.0.5](https://github.com/socketio/socket.io/compare/3.0.4...3.0.5) (2021-01-05)
 
 
@@ -255,6 +546,17 @@ we only add a field in the JSON-encoded handshake data:
 ### Reverts
 
 * restore the socket middleware functionality ([bf54327](https://github.com/socketio/socket.io/commit/bf5432742158e4d5ba2722cff4a614967dffa5b9))
+
+
+
+# [2.4.0](https://github.com/socketio/socket.io/compare/2.3.0...2.4.0) (2021-01-04)
+
+
+### Bug Fixes
+
+* **security:** do not allow all origins by default ([f78a575](https://github.com/socketio/socket.io/commit/f78a575f66ab693c3ea96ea88429ddb1a44c86c7))
+* properly overwrite the query sent in the handshake ([d33a619](https://github.com/socketio/socket.io/commit/d33a619905a4905c153d4fec337c74da5b533a9e))
+
 
 
 ## [3.0.4](https://github.com/socketio/socket.io/compare/3.0.3...3.0.4) (2020-12-07)
@@ -542,3 +844,78 @@ io.of("/admin").use((socket, next) => {
 
 This method was kept for backward-compatibility with pre-1.0 versions.
 
+
+
+# [2.3.0](https://github.com/socketio/socket.io/compare/2.2.0...2.3.0) (2019-09-20)
+
+This release mainly contains a bump of the `engine.io` and `ws` packages, but no additional features.
+
+
+
+# [2.2.0](https://github.com/socketio/socket.io/compare/2.1.1...2.2.0) (2018-11-29)
+
+### Features
+
+- add cache-control header when serving the client source ([#2907](https://github.com/socketio/socket.io/pull/2907)) ([b00ae50](https://github.com/socketio/socket.io/commit/b00ae50be65d1bc88fa95145f1c486a6886a6b76))
+
+### Bug fixes
+
+- throw an error when trying to access the clients of a dynamic namespace ([#3355](https://github.com/socketio/socket.io/pull/3355)) ([a7fbd1a](https://github.com/socketio/socket.io/commit/a7fbd1ac4a47cafd832fc62e371754df924c5903))
+
+
+
+# [2.1.1](https://github.com/socketio/socket.io/compare/2.1.0...2.1.1) (2018-05-17)
+
+### Features
+
+- add local flag to the socket object ([#3129](https://github.com/socketio/socket.io/pull/3219)) ([1decae3](https://github.com/socketio/socket.io/commit/1decae341c80c0417b32d3124ca30c005240b48a))
+
+```js
+socket.local.to('room101').emit(/* */);
+```
+
+
+# [2.1.0](https://github.com/socketio/socket.io/compare/2.1.1...2.2.0) (2018-03-29)
+
+### Features
+
+- add a 'binary' flag ([#3185](https://github.com/socketio/socket.io/pull/3185)) ([f48a06c](https://github.com/socketio/socket.io/commit/f48a06c040280b44f90fd225c888910544fd63b5))
+
+```js
+// by default, the object is recursively scanned to check whether it contains some binary data
+// in the following example, the check is skipped in order to improve performance
+socket.binary(false).emit('plain-object', object);
+
+// it also works at the namespace level
+io.binary(false).emit('plain-object', object);
+```
+
+- add support for dynamic namespaces ([#3195](https://github.com/socketio/socket.io/pull/3195)) ([c0c79f0](https://github.com/socketio/socket.io/commit/c0c79f019e7138194e438339f8192705957c8ec3))
+
+```js
+io.of(/^\/dynamic-\d+$/).on('connect', (socket) => {
+  // socket.nsp.name = '/dynamic-101'
+});
+
+// client-side
+const client = require('socket.io-client')('/dynamic-101');
+```
+
+### Bug fixes
+
+- properly emit 'connect' when using a custom namespace ([#3197](https://github.com/socketio/socket.io/pull/3197)) ([f4fc517](https://github.com/socketio/socket.io/commit/f4fc517e0fe25866c95b584291487b8cbdff889d))
+- include the protocol in the origins check ([#3198](https://github.com/socketio/socket.io/pull/3198)) ([1f1d64b](https://github.com/socketio/socket.io/commit/1f1d64bab61a273712a199591a3f76210d8c0959))
+
+### Important note :warning: from Engine.IO [3.2.0 release](https://github.com/socketio/engine.io/releases/tag/3.2.0)
+
+There are two non-breaking changes that are somehow quite important:
+
+- `ws` was reverted as the default wsEngine (https://github.com/socketio/engine.io/pull/550), as there was several blocking issues with `uws`. You can still use `uws` by running `npm install uws --save` in your project and using the `wsEngine` option:
+```js
+var engine = require('engine.io');
+var server = engine.listen(3000, {
+  wsEngine: 'uws'
+});
+```
+
+- `pingTimeout` now defaults to 5 seconds (instead of 60 seconds): https://github.com/socketio/engine.io/pull/551

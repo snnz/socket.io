@@ -7,6 +7,11 @@ import type {
   EventNames,
   EventsMap,
   TypedEventBroadcaster,
+  DecorateAcknowledgements,
+  DecorateAcknowledgementsWithTimeoutAndMultipleResponses,
+  AllButLast,
+  Last,
+  SecondArg,
 } from "./typed-events";
 
 export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
@@ -16,24 +21,35 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
     private readonly adapter: Adapter,
     private readonly rooms: Set<Room> = new Set<Room>(),
     private readonly exceptRooms: Set<Room> = new Set<Room>(),
-    private readonly flags: BroadcastFlags = {}
+    private readonly flags: BroadcastFlags & {
+      expectSingleResponse?: boolean;
+    } = {}
   ) {}
 
   /**
    * Targets a room when emitting.
    *
-   * @param room
-   * @return a new BroadcastOperator instance
-   * @public
+   * @example
+   * // the “foo” event will be broadcast to all connected clients in the “room-101” room
+   * io.to("room-101").emit("foo", "bar");
+   *
+   * // with an array of rooms (a client will be notified at most once)
+   * io.to(["room-101", "room-102"]).emit("foo", "bar");
+   *
+   * // with multiple chained calls
+   * io.to("room-101").to("room-102").emit("foo", "bar");
+   *
+   * @param room - a room, or an array of rooms
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public to(room: Room | Room[]): BroadcastOperator<EmitEvents, SocketData> {
+  public to(room: Room | Room[]) {
     const rooms = new Set(this.rooms);
     if (Array.isArray(room)) {
       room.forEach((r) => rooms.add(r));
     } else {
       rooms.add(room);
     }
-    return new BroadcastOperator(
+    return new BroadcastOperator<EmitEvents, SocketData>(
       this.adapter,
       rooms,
       this.exceptRooms,
@@ -42,33 +58,43 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
   }
 
   /**
-   * Targets a room when emitting.
+   * Targets a room when emitting. Similar to `to()`, but might feel clearer in some cases:
    *
-   * @param room
-   * @return a new BroadcastOperator instance
-   * @public
+   * @example
+   * // disconnect all clients in the "room-101" room
+   * io.in("room-101").disconnectSockets();
+   *
+   * @param room - a room, or an array of rooms
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public in(room: Room | Room[]): BroadcastOperator<EmitEvents, SocketData> {
+  public in(room: Room | Room[]) {
     return this.to(room);
   }
 
   /**
    * Excludes a room when emitting.
    *
-   * @param room
-   * @return a new BroadcastOperator instance
-   * @public
+   * @example
+   * // the "foo" event will be broadcast to all connected clients, except the ones that are in the "room-101" room
+   * io.except("room-101").emit("foo", "bar");
+   *
+   * // with an array of rooms
+   * io.except(["room-101", "room-102"]).emit("foo", "bar");
+   *
+   * // with multiple chained calls
+   * io.except("room-101").except("room-102").emit("foo", "bar");
+   *
+   * @param room - a room, or an array of rooms
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public except(
-    room: Room | Room[]
-  ): BroadcastOperator<EmitEvents, SocketData> {
+  public except(room: Room | Room[]) {
     const exceptRooms = new Set(this.exceptRooms);
     if (Array.isArray(room)) {
       room.forEach((r) => exceptRooms.add(r));
     } else {
       exceptRooms.add(room);
     }
-    return new BroadcastOperator(
+    return new BroadcastOperator<EmitEvents, SocketData>(
       this.adapter,
       this.rooms,
       exceptRooms,
@@ -79,15 +105,15 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
   /**
    * Sets the compress flag.
    *
+   * @example
+   * io.compress(false).emit("hello");
+   *
    * @param compress - if `true`, compresses the sending data
    * @return a new BroadcastOperator instance
-   * @public
    */
-  public compress(
-    compress: boolean
-  ): BroadcastOperator<EmitEvents, SocketData> {
+  public compress(compress: boolean) {
     const flags = Object.assign({}, this.flags, { compress });
-    return new BroadcastOperator(
+    return new BroadcastOperator<EmitEvents, SocketData>(
       this.adapter,
       this.rooms,
       this.exceptRooms,
@@ -100,12 +126,14 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
    * receive messages (because of network slowness or other issues, or because they’re connected through long polling
    * and is in the middle of a request-response cycle).
    *
+   * @example
+   * io.volatile.emit("hello"); // the clients may or may not receive it
+   *
    * @return a new BroadcastOperator instance
-   * @public
    */
-  public get volatile(): BroadcastOperator<EmitEvents, SocketData> {
+  public get volatile() {
     const flags = Object.assign({}, this.flags, { volatile: true });
-    return new BroadcastOperator(
+    return new BroadcastOperator<EmitEvents, SocketData>(
       this.adapter,
       this.rooms,
       this.exceptRooms,
@@ -116,12 +144,15 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
   /**
    * Sets a modifier for a subsequent event emission that the event data will only be broadcast to the current node.
    *
-   * @return a new BroadcastOperator instance
-   * @public
+   * @example
+   * // the “foo” event will be broadcast to all connected clients on this node
+   * io.local.emit("foo", "bar");
+   *
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public get local(): BroadcastOperator<EmitEvents, SocketData> {
+  public get local() {
     const flags = Object.assign({}, this.flags, { local: true });
-    return new BroadcastOperator(
+    return new BroadcastOperator<EmitEvents, SocketData>(
       this.adapter,
       this.rooms,
       this.exceptRooms,
@@ -132,31 +163,45 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
   /**
    * Adds a timeout in milliseconds for the next operation
    *
-   * <pre><code>
-   *
+   * @example
    * io.timeout(1000).emit("some-event", (err, responses) => {
-   *   // ...
+   *   if (err) {
+   *     // some clients did not acknowledge the event in the given delay
+   *   } else {
+   *     console.log(responses); // one response per client
+   *   }
    * });
-   *
-   * </pre></code>
    *
    * @param timeout
    */
   public timeout(timeout: number): BroadcastOperator<EmitEvents, SocketData> {
     const flags = Object.assign({}, this.flags, { timeout });
-    return new BroadcastOperator(
-      this.adapter,
-      this.rooms,
-      this.exceptRooms,
-      flags
-    );
+    return new BroadcastOperator<
+      DecorateAcknowledgementsWithTimeoutAndMultipleResponses<EmitEvents>,
+      SocketData
+    >(this.adapter, this.rooms, this.exceptRooms, flags);
   }
 
   /**
    * Emits to all clients.
    *
+   * @example
+   * // the “foo” event will be broadcast to all connected clients
+   * io.emit("foo", "bar");
+   *
+   * // the “foo” event will be broadcast to all connected clients in the “room-101” room
+   * io.to("room-101").emit("foo", "bar");
+   *
+   * // with an acknowledgement expected from all connected clients
+   * io.timeout(1000).emit("some-event", (err, responses) => {
+   *   if (err) {
+   *     // some clients did not acknowledge the event in the given delay
+   *   } else {
+   *     console.log(responses); // one response per client
+   *   }
+   * });
+   *
    * @return Always true
-   * @public
    */
   public emit<Ev extends EventNames<EmitEvents>>(
     ev: Ev,
@@ -186,9 +231,40 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
   }
 
   /**
+   * Emits an event and waits for an acknowledgement from all clients.
+   *
+   * @example
+   * try {
+   *   const responses = await io.timeout(1000).emitWithAck("some-event");
+   *   console.log(responses); // one response per client
+   * } catch (e) {
+   *   // some clients did not acknowledge the event in the given delay
+   * }
+   *
+   * @return a Promise that will be fulfilled when all clients have acknowledged the event
+   */
+  public emitWithAck<Ev extends EventNames<EmitEvents>>(
+    ev: Ev,
+    ...args: AllButLast<EventParams<EmitEvents, Ev>>
+  ): Promise<SecondArg<Last<EventParams<EmitEvents, Ev>>>> {
+    return new Promise((resolve, reject) => {
+      args.push((err, responses) => {
+        if (err) {
+          err.responses = responses;
+          return reject(err);
+        } else {
+          return resolve(responses);
+        }
+      });
+      this.emit(ev, ...(args as any[] as EventParams<EmitEvents, Ev>));
+    });
+  }
+
+  /**
    * Gets a list of clients.
    *
-   * @public
+   * @deprecated this method will be removed in the next major release, please use {@link Server#serverSideEmit} or
+   * {@link fetchSockets} instead.
    */
   public allSockets(): Promise<Set<SocketId>> {
     if (!this.adapter) {
@@ -200,13 +276,30 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
   }
 
   /**
-   * Returns the matching socket instances
+   * Returns the matching socket instances. This method works across a cluster of several Socket.IO servers.
    *
-   * @public
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
+   *
+   * @example
+   * // return all Socket instances
+   * const sockets = await io.fetchSockets();
+   *
+   * // return all Socket instances in the "room1" room
+   * const sockets = await io.in("room1").fetchSockets();
+   *
+   * for (const socket of sockets) {
+   *   console.log(socket.id);
+   *   console.log(socket.handshake);
+   *   console.log(socket.rooms);
+   *   console.log(socket.data);
+   *
+   *   socket.emit("hello");
+   *   socket.join("room1");
+   *   socket.leave("room2");
+   *   socket.disconnect();
+   * }
    */
-  public fetchSockets<SocketData = any>(): Promise<
-    RemoteSocket<EmitEvents, SocketData>[]
-  > {
+  public fetchSockets(): Promise<RemoteSocket<EmitEvents, SocketData>[]> {
     return this.adapter
       .fetchSockets({
         rooms: this.rooms,
@@ -229,10 +322,19 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
   }
 
   /**
-   * Makes the matching socket instances join the specified rooms
+   * Makes the matching socket instances join the specified rooms.
    *
-   * @param room
-   * @public
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
+   *
+   * @example
+   *
+   * // make all socket instances join the "room1" room
+   * io.socketsJoin("room1");
+   *
+   * // make all socket instances in the "room1" room join the "room2" and "room3" rooms
+   * io.in("room1").socketsJoin(["room2", "room3"]);
+   *
+   * @param room - a room, or an array of rooms
    */
   public socketsJoin(room: Room | Room[]): void {
     this.adapter.addSockets(
@@ -246,10 +348,18 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
   }
 
   /**
-   * Makes the matching socket instances leave the specified rooms
+   * Makes the matching socket instances leave the specified rooms.
    *
-   * @param room
-   * @public
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
+   *
+   * @example
+   * // make all socket instances leave the "room1" room
+   * io.socketsLeave("room1");
+   *
+   * // make all socket instances in the "room1" room leave the "room2" and "room3" rooms
+   * io.in("room1").socketsLeave(["room2", "room3"]);
+   *
+   * @param room - a room, or an array of rooms
    */
   public socketsLeave(room: Room | Room[]): void {
     this.adapter.delSockets(
@@ -263,10 +373,18 @@ export class BroadcastOperator<EmitEvents extends EventsMap, SocketData>
   }
 
   /**
-   * Makes the matching socket instances disconnect
+   * Makes the matching socket instances disconnect.
+   *
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
+   *
+   * @example
+   * // make all socket instances disconnect (the connections might be kept alive for other namespaces)
+   * io.disconnectSockets();
+   *
+   * // make all socket instances in the "room1" room disconnect and close the underlying connections
+   * io.in("room1").disconnectSockets(true);
    *
    * @param close - whether to close the underlying connection
-   * @public
    */
   public disconnectSockets(close: boolean = false): void {
     this.adapter.disconnectSockets(
@@ -308,7 +426,44 @@ export class RemoteSocket<EmitEvents extends EventsMap, SocketData>
     this.handshake = details.handshake;
     this.rooms = new Set(details.rooms);
     this.data = details.data;
-    this.operator = new BroadcastOperator(adapter, new Set([this.id]));
+    this.operator = new BroadcastOperator<EmitEvents, SocketData>(
+      adapter,
+      new Set([this.id]),
+      new Set(),
+      {
+        expectSingleResponse: true, // so that remoteSocket.emit() with acknowledgement behaves like socket.emit()
+      }
+    );
+  }
+
+  /**
+   * Adds a timeout in milliseconds for the next operation.
+   *
+   * @example
+   * const sockets = await io.fetchSockets();
+   *
+   * for (const socket of sockets) {
+   *   if (someCondition) {
+   *     socket.timeout(1000).emit("some-event", (err) => {
+   *       if (err) {
+   *         // the client did not acknowledge the event in the given delay
+   *       }
+   *     });
+   *   }
+   * }
+   *
+   * // note: if possible, using a room instead of looping over all sockets is preferable
+   * io.timeout(1000).to(someConditionRoom).emit("some-event", (err, responses) => {
+   *   // ...
+   * });
+   *
+   * @param timeout
+   */
+  public timeout(timeout: number) {
+    return this.operator.timeout(timeout) as BroadcastOperator<
+      DecorateAcknowledgements<EmitEvents>,
+      SocketData
+    >;
   }
 
   public emit<Ev extends EventNames<EmitEvents>>(
@@ -322,7 +477,6 @@ export class RemoteSocket<EmitEvents extends EventsMap, SocketData>
    * Joins a room.
    *
    * @param {String|Array} room - room or array of rooms
-   * @public
    */
   public join(room: Room | Room[]): void {
     return this.operator.socketsJoin(room);
@@ -332,7 +486,6 @@ export class RemoteSocket<EmitEvents extends EventsMap, SocketData>
    * Leaves a room.
    *
    * @param {String} room
-   * @public
    */
   public leave(room: Room): void {
     return this.operator.socketsLeave(room);
@@ -343,8 +496,6 @@ export class RemoteSocket<EmitEvents extends EventsMap, SocketData>
    *
    * @param {Boolean} close - if `true`, closes the underlying connection
    * @return {Socket} self
-   *
-   * @public
    */
   public disconnect(close = false): this {
     this.operator.disconnectSockets(close);

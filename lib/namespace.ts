@@ -6,11 +6,16 @@ import {
   EventsMap,
   StrictEventEmitter,
   DefaultEventsMap,
+  DecorateAcknowledgementsWithTimeoutAndMultipleResponses,
+  AllButLast,
+  Last,
+  FirstArg,
+  SecondArg,
 } from "./typed-events";
 import type { Client } from "./client";
 import debugModule from "debug";
 import type { Adapter, Room, SocketId } from "socket.io-adapter";
-import { BroadcastOperator, RemoteSocket } from "./broadcast-operator";
+import { BroadcastOperator } from "./broadcast-operator";
 
 const debug = debugModule("socket.io:namespace");
 
@@ -52,6 +57,59 @@ export const RESERVED_EVENTS: ReadonlySet<string | Symbol> = new Set<
   keyof ServerReservedEventsMap<never, never, never, never>
 >(<const>["connect", "connection", "new_namespace"]);
 
+/**
+ * A Namespace is a communication channel that allows you to split the logic of your application over a single shared
+ * connection.
+ *
+ * Each namespace has its own:
+ *
+ * - event handlers
+ *
+ * ```
+ * io.of("/orders").on("connection", (socket) => {
+ *   socket.on("order:list", () => {});
+ *   socket.on("order:create", () => {});
+ * });
+ *
+ * io.of("/users").on("connection", (socket) => {
+ *   socket.on("user:list", () => {});
+ * });
+ * ```
+ *
+ * - rooms
+ *
+ * ```
+ * const orderNamespace = io.of("/orders");
+ *
+ * orderNamespace.on("connection", (socket) => {
+ *   socket.join("room1");
+ *   orderNamespace.to("room1").emit("hello");
+ * });
+ *
+ * const userNamespace = io.of("/users");
+ *
+ * userNamespace.on("connection", (socket) => {
+ *   socket.join("room1"); // distinct from the room in the "orders" namespace
+ *   userNamespace.to("room1").emit("holà");
+ * });
+ * ```
+ *
+ * - middlewares
+ *
+ * ```
+ * const orderNamespace = io.of("/orders");
+ *
+ * orderNamespace.use((socket, next) => {
+ *   // ensure the socket has access to the "orders" namespace
+ * });
+ *
+ * const userNamespace = io.of("/users");
+ *
+ * userNamespace.use((socket, next) => {
+ *   // ensure the socket has access to the "users" namespace
+ * });
+ * ```
+ */
 export class Namespace<
   ListenEvents extends EventsMap = DefaultEventsMap,
   EmitEvents extends EventsMap = ListenEvents,
@@ -123,10 +181,17 @@ export class Namespace<
   }
 
   /**
-   * Sets up namespace middleware.
+   * Registers a middleware, which is a function that gets executed for every incoming {@link Socket}.
    *
-   * @return self
-   * @public
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * myNamespace.use((socket, next) => {
+   *   // ...
+   *   next();
+   * });
+   *
+   * @param fn - the middleware function
    */
   public use(
     fn: (
@@ -171,36 +236,63 @@ export class Namespace<
   /**
    * Targets a room when emitting.
    *
-   * @param room
-   * @return self
-   * @public
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * // the “foo” event will be broadcast to all connected clients in the “room-101” room
+   * myNamespace.to("room-101").emit("foo", "bar");
+   *
+   * // with an array of rooms (a client will be notified at most once)
+   * myNamespace.to(["room-101", "room-102"]).emit("foo", "bar");
+   *
+   * // with multiple chained calls
+   * myNamespace.to("room-101").to("room-102").emit("foo", "bar");
+   *
+   * @param room - a room, or an array of rooms
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public to(room: Room | Room[]): BroadcastOperator<EmitEvents, SocketData> {
-    return new BroadcastOperator(this.adapter).to(room);
+  public to(room: Room | Room[]) {
+    return new BroadcastOperator<EmitEvents, SocketData>(this.adapter).to(room);
   }
 
   /**
-   * Targets a room when emitting.
+   * Targets a room when emitting. Similar to `to()`, but might feel clearer in some cases:
    *
-   * @param room
-   * @return self
-   * @public
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * // disconnect all clients in the "room-101" room
+   * myNamespace.in("room-101").disconnectSockets();
+   *
+   * @param room - a room, or an array of rooms
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public in(room: Room | Room[]): BroadcastOperator<EmitEvents, SocketData> {
-    return new BroadcastOperator(this.adapter).in(room);
+  public in(room: Room | Room[]) {
+    return new BroadcastOperator<EmitEvents, SocketData>(this.adapter).in(room);
   }
 
   /**
    * Excludes a room when emitting.
    *
-   * @param room
-   * @return self
-   * @public
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * // the "foo" event will be broadcast to all connected clients, except the ones that are in the "room-101" room
+   * myNamespace.except("room-101").emit("foo", "bar");
+   *
+   * // with an array of rooms
+   * myNamespace.except(["room-101", "room-102"]).emit("foo", "bar");
+   *
+   * // with multiple chained calls
+   * myNamespace.except("room-101").except("room-102").emit("foo", "bar");
+   *
+   * @param room - a room, or an array of rooms
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public except(
-    room: Room | Room[]
-  ): BroadcastOperator<EmitEvents, SocketData> {
-    return new BroadcastOperator(this.adapter).except(room);
+  public except(room: Room | Room[]) {
+    return new BroadcastOperator<EmitEvents, SocketData>(this.adapter).except(
+      room
+    );
   }
 
   /**
@@ -209,13 +301,25 @@ export class Namespace<
    * @return {Socket}
    * @private
    */
-  _add(
+  async _add(
     client: Client<ListenEvents, EmitEvents, ServerSideEvents>,
-    query,
-    fn?: () => void
-  ): Socket<ListenEvents, EmitEvents, ServerSideEvents, SocketData> {
+    auth: Record<string, unknown>,
+    fn: (
+      socket: Socket<ListenEvents, EmitEvents, ServerSideEvents, SocketData>
+    ) => void
+  ) {
     debug("adding socket to nsp %s", this.name);
-    const socket = new Socket(this, client, query);
+    const socket = await this._createSocket(client, auth);
+
+    if (
+      // @ts-ignore
+      this.server.opts.connectionStateRecovery?.skipMiddlewares &&
+      socket.recovered &&
+      client.conn.readyState === "open"
+    ) {
+      return this._doConnect(socket, fn);
+    }
+
     this.run(socket, (err) => {
       process.nextTick(() => {
         if ("open" !== client.conn.readyState) {
@@ -237,22 +341,53 @@ export class Namespace<
           }
         }
 
-        // track socket
-        this.sockets.set(socket.id, socket);
-
-        // it's paramount that the internal `onconnect` logic
-        // fires before user-set events to prevent state order
-        // violations (such as a disconnection before the connection
-        // logic is complete)
-        socket._onconnect();
-        if (fn) fn();
-
-        // fire user-set events
-        this.emitReserved("connect", socket);
-        this.emitReserved("connection", socket);
+        this._doConnect(socket, fn);
       });
     });
-    return socket;
+  }
+
+  private async _createSocket(
+    client: Client<ListenEvents, EmitEvents, ServerSideEvents>,
+    auth: Record<string, unknown>
+  ) {
+    const sessionId = auth.pid;
+    const offset = auth.offset;
+    if (
+      // @ts-ignore
+      this.server.opts.connectionStateRecovery &&
+      typeof sessionId === "string" &&
+      typeof offset === "string"
+    ) {
+      const session = await this.adapter.restoreSession(sessionId, offset);
+      if (session) {
+        debug("connection state recovered for sid %s", session.sid);
+        return new Socket(this, client, auth, session);
+      } else {
+        debug("unable to restore session state");
+      }
+    }
+    return new Socket(this, client, auth);
+  }
+
+  private _doConnect(
+    socket: Socket<ListenEvents, EmitEvents, ServerSideEvents, SocketData>,
+    fn: (
+      socket: Socket<ListenEvents, EmitEvents, ServerSideEvents, SocketData>
+    ) => void
+  ) {
+    // track socket
+    this.sockets.set(socket.id, socket);
+
+    // it's paramount that the internal `onconnect` logic
+    // fires before user-set events to prevent state order
+    // violations (such as a disconnection before the connection
+    // logic is complete)
+    socket._onconnect();
+    if (fn) fn(socket);
+
+    // fire user-set events
+    this.emitReserved("connect", socket);
+    this.emitReserved("connection", socket);
   }
 
   /**
@@ -271,10 +406,26 @@ export class Namespace<
   }
 
   /**
-   * Emits to all clients.
+   * Emits to all connected clients.
+   *
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * myNamespace.emit("hello", "world");
+   *
+   * // all serializable datastructures are supported (no need to call JSON.stringify)
+   * myNamespace.emit("hello", 1, "2", { 3: ["4"], 5: Uint8Array.from([6]) });
+   *
+   * // with an acknowledgement from the clients
+   * myNamespace.timeout(1000).emit("some-event", (err, responses) => {
+   *   if (err) {
+   *     // some clients did not acknowledge the event in the given delay
+   *   } else {
+   *     console.log(responses); // one response per client
+   *   }
+   * });
    *
    * @return Always true
-   * @public
    */
   public emit<Ev extends EventNames<EmitEvents>>(
     ev: Ev,
@@ -287,10 +438,45 @@ export class Namespace<
   }
 
   /**
+   * Emits an event and waits for an acknowledgement from all clients.
+   *
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * try {
+   *   const responses = await myNamespace.timeout(1000).emitWithAck("some-event");
+   *   console.log(responses); // one response per client
+   * } catch (e) {
+   *   // some clients did not acknowledge the event in the given delay
+   * }
+   *
+   * @return a Promise that will be fulfilled when all clients have acknowledged the event
+   */
+  public emitWithAck<Ev extends EventNames<EmitEvents>>(
+    ev: Ev,
+    ...args: AllButLast<EventParams<EmitEvents, Ev>>
+  ): Promise<SecondArg<Last<EventParams<EmitEvents, Ev>>>> {
+    return new BroadcastOperator<EmitEvents, SocketData>(
+      this.adapter
+    ).emitWithAck(ev, ...args);
+  }
+
+  /**
    * Sends a `message` event to all clients.
    *
+   * This method mimics the WebSocket.send() method.
+   *
+   * @see https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/send
+   *
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * myNamespace.send("hello");
+   *
+   * // this is equivalent to
+   * myNamespace.emit("message", "hello");
+   *
    * @return self
-   * @public
    */
   public send(...args: EventParams<EmitEvents, "message">): this {
     this.emit("message", ...args);
@@ -298,10 +484,9 @@ export class Namespace<
   }
 
   /**
-   * Sends a `message` event to all clients.
+   * Sends a `message` event to all clients. Sends a `message` event. Alias of {@link send}.
    *
    * @return self
-   * @public
    */
   public write(...args: EventParams<EmitEvents, "message">): this {
     this.emit("message", ...args);
@@ -309,15 +494,39 @@ export class Namespace<
   }
 
   /**
-   * Emit a packet to other Socket.IO servers
+   * Sends a message to the other Socket.IO servers of the cluster.
+   *
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * myNamespace.serverSideEmit("hello", "world");
+   *
+   * myNamespace.on("hello", (arg1) => {
+   *   console.log(arg1); // prints "world"
+   * });
+   *
+   * // acknowledgements (without binary content) are supported too:
+   * myNamespace.serverSideEmit("ping", (err, responses) => {
+   *  if (err) {
+   *     // some servers did not acknowledge the event in the given delay
+   *   } else {
+   *     console.log(responses); // one response per server (except the current one)
+   *   }
+   * });
+   *
+   * myNamespace.on("ping", (cb) => {
+   *   cb("pong");
+   * });
    *
    * @param ev - the event name
    * @param args - an array of arguments, which may include an acknowledgement callback at the end
-   * @public
    */
   public serverSideEmit<Ev extends EventNames<ServerSideEvents>>(
     ev: Ev,
-    ...args: EventParams<ServerSideEvents, Ev>
+    ...args: EventParams<
+      DecorateAcknowledgementsWithTimeoutAndMultipleResponses<ServerSideEvents>,
+      Ev
+    >
   ): boolean {
     if (RESERVED_EVENTS.has(ev)) {
       throw new Error(`"${String(ev)}" is a reserved event name`);
@@ -325,6 +534,44 @@ export class Namespace<
     args.unshift(ev);
     this.adapter.serverSideEmit(args);
     return true;
+  }
+
+  /**
+   * Sends a message and expect an acknowledgement from the other Socket.IO servers of the cluster.
+   *
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * try {
+   *   const responses = await myNamespace.serverSideEmitWithAck("ping");
+   *   console.log(responses); // one response per server (except the current one)
+   * } catch (e) {
+   *   // some servers did not acknowledge the event in the given delay
+   * }
+   *
+   * @param ev - the event name
+   * @param args - an array of arguments
+   *
+   * @return a Promise that will be fulfilled when all servers have acknowledged the event
+   */
+  public serverSideEmitWithAck<Ev extends EventNames<ServerSideEvents>>(
+    ev: Ev,
+    ...args: AllButLast<EventParams<ServerSideEvents, Ev>>
+  ): Promise<FirstArg<Last<EventParams<ServerSideEvents, Ev>>>[]> {
+    return new Promise((resolve, reject) => {
+      args.push((err, responses) => {
+        if (err) {
+          err.responses = responses;
+          return reject(err);
+        } else {
+          return resolve(responses);
+        }
+      });
+      this.serverSideEmit(
+        ev,
+        ...(args as any[] as EventParams<ServerSideEvents, Ev>)
+      );
+    });
   }
 
   /**
@@ -341,24 +588,30 @@ export class Namespace<
   /**
    * Gets a list of clients.
    *
-   * @return self
-   * @public
+   * @deprecated this method will be removed in the next major release, please use {@link Namespace#serverSideEmit} or
+   * {@link Namespace#fetchSockets} instead.
    */
   public allSockets(): Promise<Set<SocketId>> {
-    return new BroadcastOperator(this.adapter).allSockets();
+    return new BroadcastOperator<EmitEvents, SocketData>(
+      this.adapter
+    ).allSockets();
   }
 
   /**
    * Sets the compress flag.
    *
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * myNamespace.compress(false).emit("hello");
+   *
    * @param compress - if `true`, compresses the sending data
    * @return self
-   * @public
    */
-  public compress(
-    compress: boolean
-  ): BroadcastOperator<EmitEvents, SocketData> {
-    return new BroadcastOperator(this.adapter).compress(compress);
+  public compress(compress: boolean) {
+    return new BroadcastOperator<EmitEvents, SocketData>(this.adapter).compress(
+      compress
+    );
   }
 
   /**
@@ -366,76 +619,149 @@ export class Namespace<
    * receive messages (because of network slowness or other issues, or because they’re connected through long polling
    * and is in the middle of a request-response cycle).
    *
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * myNamespace.volatile.emit("hello"); // the clients may or may not receive it
+   *
    * @return self
-   * @public
    */
-  public get volatile(): BroadcastOperator<EmitEvents, SocketData> {
-    return new BroadcastOperator(this.adapter).volatile;
+  public get volatile() {
+    return new BroadcastOperator<EmitEvents, SocketData>(this.adapter).volatile;
   }
 
   /**
    * Sets a modifier for a subsequent event emission that the event data will only be broadcast to the current node.
    *
-   * @return self
-   * @public
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * // the “foo” event will be broadcast to all connected clients on this node
+   * myNamespace.local.emit("foo", "bar");
+   *
+   * @return a new {@link BroadcastOperator} instance for chaining
    */
-  public get local(): BroadcastOperator<EmitEvents, SocketData> {
-    return new BroadcastOperator(this.adapter).local;
+  public get local() {
+    return new BroadcastOperator<EmitEvents, SocketData>(this.adapter).local;
   }
 
   /**
-   * Adds a timeout in milliseconds for the next operation
+   * Adds a timeout in milliseconds for the next operation.
    *
-   * <pre><code>
+   * @example
+   * const myNamespace = io.of("/my-namespace");
    *
-   * io.timeout(1000).emit("some-event", (err, responses) => {
-   *   // ...
+   * myNamespace.timeout(1000).emit("some-event", (err, responses) => {
+   *   if (err) {
+   *     // some clients did not acknowledge the event in the given delay
+   *   } else {
+   *     console.log(responses); // one response per client
+   *   }
    * });
-   *
-   * </pre></code>
    *
    * @param timeout
    */
   public timeout(timeout: number) {
-    return new BroadcastOperator(this.adapter).timeout(timeout);
+    return new BroadcastOperator<EmitEvents, SocketData>(this.adapter).timeout(
+      timeout
+    );
   }
 
   /**
-   * Returns the matching socket instances
+   * Returns the matching socket instances.
    *
-   * @public
-   */
-  public fetchSockets(): Promise<RemoteSocket<EmitEvents, SocketData>[]> {
-    return new BroadcastOperator(this.adapter).fetchSockets();
-  }
-
-  /**
-   * Makes the matching socket instances join the specified rooms
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
    *
-   * @param room
-   * @public
-   */
-  public socketsJoin(room: Room | Room[]): void {
-    return new BroadcastOperator(this.adapter).socketsJoin(room);
-  }
-
-  /**
-   * Makes the matching socket instances leave the specified rooms
+   * @example
+   * const myNamespace = io.of("/my-namespace");
    *
-   * @param room
-   * @public
+   * // return all Socket instances
+   * const sockets = await myNamespace.fetchSockets();
+   *
+   * // return all Socket instances in the "room1" room
+   * const sockets = await myNamespace.in("room1").fetchSockets();
+   *
+   * for (const socket of sockets) {
+   *   console.log(socket.id);
+   *   console.log(socket.handshake);
+   *   console.log(socket.rooms);
+   *   console.log(socket.data);
+   *
+   *   socket.emit("hello");
+   *   socket.join("room1");
+   *   socket.leave("room2");
+   *   socket.disconnect();
+   * }
    */
-  public socketsLeave(room: Room | Room[]): void {
-    return new BroadcastOperator(this.adapter).socketsLeave(room);
+  public fetchSockets() {
+    return new BroadcastOperator<EmitEvents, SocketData>(
+      this.adapter
+    ).fetchSockets();
   }
 
   /**
-   * Makes the matching socket instances disconnect
+   * Makes the matching socket instances join the specified rooms.
+   *
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
+   *
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * // make all socket instances join the "room1" room
+   * myNamespace.socketsJoin("room1");
+   *
+   * // make all socket instances in the "room1" room join the "room2" and "room3" rooms
+   * myNamespace.in("room1").socketsJoin(["room2", "room3"]);
+   *
+   * @param room - a room, or an array of rooms
+   */
+  public socketsJoin(room: Room | Room[]) {
+    return new BroadcastOperator<EmitEvents, SocketData>(
+      this.adapter
+    ).socketsJoin(room);
+  }
+
+  /**
+   * Makes the matching socket instances leave the specified rooms.
+   *
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
+   *
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * // make all socket instances leave the "room1" room
+   * myNamespace.socketsLeave("room1");
+   *
+   * // make all socket instances in the "room1" room leave the "room2" and "room3" rooms
+   * myNamespace.in("room1").socketsLeave(["room2", "room3"]);
+   *
+   * @param room - a room, or an array of rooms
+   */
+  public socketsLeave(room: Room | Room[]) {
+    return new BroadcastOperator<EmitEvents, SocketData>(
+      this.adapter
+    ).socketsLeave(room);
+  }
+
+  /**
+   * Makes the matching socket instances disconnect.
+   *
+   * Note: this method also works within a cluster of multiple Socket.IO servers, with a compatible {@link Adapter}.
+   *
+   * @example
+   * const myNamespace = io.of("/my-namespace");
+   *
+   * // make all socket instances disconnect (the connections might be kept alive for other namespaces)
+   * myNamespace.disconnectSockets();
+   *
+   * // make all socket instances in the "room1" room disconnect and close the underlying connections
+   * myNamespace.in("room1").disconnectSockets(true);
    *
    * @param close - whether to close the underlying connection
-   * @public
    */
-  public disconnectSockets(close: boolean = false): void {
-    return new BroadcastOperator(this.adapter).disconnectSockets(close);
+  public disconnectSockets(close: boolean = false) {
+    return new BroadcastOperator<EmitEvents, SocketData>(
+      this.adapter
+    ).disconnectSockets(close);
   }
 }
