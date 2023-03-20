@@ -6,12 +6,11 @@ import { createDeflate, createGzip, createBrotliCompress } from "zlib";
 import accepts = require("accepts");
 import { pipeline } from "stream";
 import path = require("path");
-import {
-  attach,
-  Server as Engine,
+import { attach, Server as Engine, uServer } from "engine.io";
+import type {
   ServerOptions as EngineOptions,
   AttachOptions,
-  uServer,
+  BaseServer,
 } from "engine.io";
 import { Client } from "./client";
 import { EventEmitter } from "events";
@@ -41,7 +40,6 @@ import {
   SecondArg,
 } from "./typed-events";
 import { patchAdapter, restoreAdapter, serveFile } from "./uws";
-import type { BaseServer } from "engine.io/build/server";
 
 const debug = debugModule("socket.io:server");
 
@@ -180,6 +178,18 @@ export class Server<
     ParentNspNameMatchFn,
     ParentNamespace<ListenEvents, EmitEvents, ServerSideEvents, SocketData>
   > = new Map();
+
+  /**
+   * A subset of the {@link parentNsps} map, only containing {@link ParentNamespace} which are based on a regular
+   * expression.
+   *
+   * @private
+   */
+  private parentNamespacesFromRegExp: Map<
+    RegExp,
+    ParentNamespace<ListenEvents, EmitEvents, ServerSideEvents, SocketData>
+  > = new Map();
+
   private _adapter?: AdapterConstructor;
   private _serveClient: boolean;
   private readonly opts: Partial<ServerOptions>;
@@ -316,8 +326,6 @@ export class Server<
         }
         const namespace = this.parentNsps.get(nextFn.value)!.createChild(name);
         debug("dynamic namespace %s was created", name);
-        // @ts-ignore
-        this.sockets.emitReserved("new_namespace", namespace);
         fn(namespace);
       });
     };
@@ -693,6 +701,7 @@ export class Server<
           (nsp, conn, next) => next(null, (name as RegExp).test(nsp)),
           parentNsp
         );
+        this.parentNamespacesFromRegExp.set(name, parentNsp);
       }
       if (fn) {
         // @ts-ignore
@@ -705,6 +714,13 @@ export class Server<
 
     let nsp = this._nsps.get(name);
     if (!nsp) {
+      for (const [regex, parentNamespace] of this.parentNamespacesFromRegExp) {
+        if (regex.test(name as string)) {
+          debug("attaching namespace %s to parent namespace %s", name, regex);
+          return parentNamespace.createChild(name as string);
+        }
+      }
+
       debug("initializing namespace %s", name);
       nsp = new Namespace(this, name);
       this._nsps.set(name, nsp);
